@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 
 from . import schemas
@@ -1920,4 +1921,191 @@ def get_delivery_check(
         current_missing_ranges=[list(x) for x in current["missing"]],
         current_out_of_range_frames=current["out_of_range"],
         current_defect_frames=current["defect_frames"],
+    )
+
+
+# ---------- 胶卷母版选片 ----------
+
+# 合格候选：(批次原导入顺序, batch_id, 原始列表位置)；旧批次位置为 None
+_PickCandidate = tuple[int, str, int | None]
+
+_INF = 1 << 60  # 远大于任何可能的切换次数（最多为段长 − 1）
+
+
+def _consecutive_runs(frames: list[int]) -> list[list[int]]:
+    """把升序帧号列表切成极大连续段（相邻帧号恰好差 1）。"""
+    runs: list[list[int]] = []
+    for f in frames:
+        if runs and f == runs[-1][-1] + 1:
+            runs[-1].append(f)
+        else:
+            runs.append([f])
+    return runs
+
+
+def _pick_key(cand: _PickCandidate) -> tuple[int, int]:
+    """候选的并列比较键：批次原导入顺序，再原始列表位置（空位置视为最小）。"""
+    order, _batch_id, pos = cand
+    return (order, pos if pos is not None else -1)
+
+
+def _min_switch_sequence(
+    seg_cands: list[list[_PickCandidate]],
+) -> list[_PickCandidate]:
+    """为一段连续可选帧选出**批次切换次数最少**的来源序列。
+
+    seg_cands[i] 为段内第 i 帧的合格候选列表（已按批次原导入顺序升序）。
+    切换次数并列时，按帧号顺序逐帧比较 (批次原导入顺序, 原始位置)，
+    取字典序最小的序列：先正向/反向 DP 求出每个候选到段首、段尾的最少
+    切换次数，再从段首贪心选取“仍在某条全局最优路径上”的最小键候选。
+    """
+    n = len(seg_cands)
+    # 前向：到达每个候选的最少切换次数
+    sw: list[list[int]] = [[0] * len(seg_cands[0])]
+    for i in range(1, n):
+        prev_global = min(sw[-1])
+        prev_same: dict[str, int] = {}
+        for j, c in enumerate(seg_cands[i - 1]):
+            prev_same[c[1]] = min(prev_same.get(c[1], _INF), sw[-1][j])
+        sw.append(
+            [
+                min(prev_same.get(c[1], _INF), prev_global + 1)
+                for c in seg_cands[i]
+            ]
+        )
+    # 后向：从每个候选到段尾的最少切换次数
+    sw_end: list[list[int]] = [[] for _ in range(n)]
+    sw_end[n - 1] = [0] * len(seg_cands[n - 1])
+    for i in range(n - 2, -1, -1):
+        next_global = min(sw_end[i + 1])
+        next_same: dict[str, int] = {}
+        for j, c in enumerate(seg_cands[i + 1]):
+            next_same[c[1]] = min(next_same.get(c[1], _INF), sw_end[i + 1][j])
+        sw_end[i] = [
+            min(next_same.get(c[1], _INF), next_global + 1)
+            for c in seg_cands[i]
+        ]
+
+    total = min(sw[-1])  # 全段最少切换次数
+    chosen: list[_PickCandidate] = []
+    prev_batch: str | None = None
+    prev_sw = 0
+    for i in range(n):
+        best: _PickCandidate | None = None
+        best_sw = 0
+        for j, c in enumerate(seg_cands[i]):
+            # 该候选须能接出全局最优（总切换数 = total）……
+            if sw[i][j] + sw_end[i][j] != total:
+                continue
+            # ……且能紧接在已选前缀之后（前缀本身切换数最优）
+            if i > 0 and sw[i][j] != prev_sw + (0 if c[1] == prev_batch else 1):
+                continue
+            if best is None or _pick_key(c) < _pick_key(best):
+                best = c
+                best_sw = sw[i][j]
+        assert best is not None  # 最优路径存在，可行候选必非空
+        chosen.append(best)
+        prev_batch = best[1]
+        prev_sw = best_sw
+    return chosen
+
+
+def master_picks(
+    conn: sqlite3.Connection, roll_no: str, start: int, end: int
+) -> schemas.MasterPicksOut:
+    """生成胶卷母版选片清单（只读，随批次撤销与瑕疵变动实时更新）。
+
+    只处理 [start, end] 与当前预期覆盖的**交集**：
+
+    - 逐帧从存活批次的扫描出现中剔除已标瑕疵的位置；同批同帧有多个合格
+      出现时取原始列表最早位置；旧批次（无原始列表）的去重帧视为一个
+      位置为空的合格候选；
+    - 对每段连续可选帧，选定批次切换次数最少的来源序列；并列时按帧号
+      顺序逐帧比较批次原导入顺序，再比较原始位置；
+    - 交集内未被扫描的部分以连续闭区间返回（区间集合运算，不逐帧展开
+      巨大帧号跨度）；已扫描却无合格候选的帧号单独按升序列出；
+    - 在一次只读事务内取数，不缓存；胶卷不存在（无存活批次）抛
+      RollNotFoundError（接口 404）。
+    """
+    conn.execute("BEGIN")
+    try:
+        if not _roll_exists(conn, roll_no):
+            raise RollNotFoundError(roll_no)
+        expected = _expected_ranges(conn, roll_no)
+        scanned = _all_frames(conn, roll_no)
+        batch_rows = conn.execute(
+            """SELECT id, raw_frames_json, frames_json
+                 FROM batches
+                WHERE roll_no = ?
+                ORDER BY created_at, rowid""",
+            (roll_no,),
+        ).fetchall()
+        defect_rows = conn.execute(
+            """SELECT batch_id, position
+                 FROM batch_defects
+                WHERE batch_id IN (SELECT id FROM batches WHERE roll_no = ?)""",
+            (roll_no,),
+        ).fetchall()
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    marked_positions: dict[str, set[int]] = {}
+    for r in defect_rows:
+        marked_positions.setdefault(r["batch_id"], set()).add(r["position"])
+
+    # 每帧的合格候选：按批次原导入顺序追加，候选列表天然按导入顺序有序
+    candidates: dict[int, list[_PickCandidate]] = {}
+    for order, br in enumerate(batch_rows):
+        if br["raw_frames_json"] is not None:
+            marked = marked_positions.get(br["id"], set())
+            earliest: dict[int, int] = {}
+            for idx, frame_no in enumerate(json.loads(br["raw_frames_json"])):
+                if idx in marked or frame_no in earliest:
+                    continue
+                earliest[frame_no] = idx
+            for frame_no, pos in earliest.items():
+                candidates.setdefault(frame_no, []).append((order, br["id"], pos))
+        else:
+            # 旧批次只有去重帧集合：每个去重帧是一个位置为空的合格候选
+            for frame_no in json.loads(br["frames_json"]):
+                candidates.setdefault(frame_no, []).append((order, br["id"], None))
+
+    coverage = intersect_intervals(expected, [(start, end)])
+
+    # 交集内的实扫帧分为“可选”（有合格候选）与“无合格候选”两类；
+    # 只遍历实际扫描过的帧，未扫描部分留给区间运算，不展开巨大帧号跨度
+    scanned_sorted = sorted(scanned)
+    selectable: list[int] = []
+    no_candidate: list[int] = []
+    for s, e in coverage:
+        lo = bisect_left(scanned_sorted, s)
+        hi = bisect_right(scanned_sorted, e)
+        for frame_no in scanned_sorted[lo:hi]:
+            if frame_no in candidates:
+                selectable.append(frame_no)
+            else:
+                no_candidate.append(frame_no)
+
+    unscanned = subtract_intervals(coverage, frames_to_ranges(scanned_sorted))
+
+    picks: list[schemas.MasterPickItem] = []
+    for run in _consecutive_runs(selectable):
+        sequence = _min_switch_sequence([candidates[f] for f in run])
+        for frame_no, (_, batch_id, pos) in zip(run, sequence):
+            picks.append(
+                schemas.MasterPickItem(
+                    frame_no=frame_no, batch_id=batch_id, position=pos
+                )
+            )
+
+    return schemas.MasterPicksOut(
+        roll_no=roll_no,
+        start=start,
+        end=end,
+        coverage_ranges=[list(x) for x in coverage],
+        picks=picks,
+        unscanned_ranges=[list(x) for x in unscanned],
+        no_candidate_frames=no_candidate,
     )

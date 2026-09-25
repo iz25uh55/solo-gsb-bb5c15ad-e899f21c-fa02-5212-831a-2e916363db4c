@@ -497,4 +497,39 @@ class SnapshotDiffOut(BaseModel):
     missing: RangeDiff = Field(..., description="缺帧区间的差异（区间集合运算）")
 
 
+# ---------- 胶卷母版选片 ----------
+
+class MasterPickItem(BaseModel):
+    frame_no: int = Field(..., description="帧号")
+    batch_id: str = Field(..., description="选定的来源批次")
+    position: int | None = Field(
+        ...,
+        description="该帧在选定批次**原始帧列表**中的位置（0 起算）；"
+        "旧批次没有原始列表时为 null",
+    )
+
+
+class MasterPicksOut(BaseModel):
+    roll_no: str
+    start: int = Field(..., description="查询帧号区间起始（含）")
+    end: int = Field(..., description="查询帧号区间结束（含）")
+    coverage_ranges: list[list[int]] = Field(
+        ..., description="查询区间与当前预期覆盖的交集闭区间（只处理这部分帧）"
+    )
+    picks: list[MasterPickItem] = Field(
+        ...,
+        description="交集内每帧的选定来源（批次号 + 原始列表位置），按帧号升序；"
+        "每段连续可选帧内批次切换次数最少，并列时按帧号顺序比较批次原导入顺序、"
+        "再比较原始位置",
+    )
+    unscanned_ranges: list[list[int]] = Field(
+        ...,
+        description="交集内未被任何存活批次扫描的连续闭区间（区间集合运算，不逐帧展开）",
+    )
+    no_candidate_frames: list[int] = Field(
+        ...,
+        description="交集内已扫描、但全部扫描出现均被标记瑕疵而无合格候选的帧号（升序）",
+    )
+
+
 RollState.model_rebuild()
