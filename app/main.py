@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）；支持批次导入预检（持久化预检单、状态指纹复核后确认导入）；支持扫描瑕疵复核（按原始帧列表 0 起算位置登记模糊/划痕/曝光异常，实时计算全出现被标记的瑕疵队列）；支持胶卷交付核验（同一事务内核验三类阻断项，全空时签发冻结核验依据与状态指纹的持久化凭证，凭证按当前批次与瑕疵标记重算有效性，历史凭证不改写）。",
-    version="1.9.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）；支持批次导入预检（持久化预检单、状态指纹复核后确认导入）；支持扫描瑕疵复核（按原始帧列表 0 起算位置登记模糊/划痕/曝光异常，实时计算全出现被标记的瑕疵队列）；支持胶卷交付核验（同一事务内核验三类阻断项，全空时签发冻结核验依据与状态指纹的持久化凭证，凭证按当前批次与瑕疵标记重算有效性，历史凭证不改写）；支持胶卷母版选片（在请求区间与当前预期覆盖的交集内逐帧剔除瑕疵出现，按最少批次切换选择每帧母版来源，返回未扫描区间与无合格候选帧，缺帧只做区间运算）。",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -270,6 +270,39 @@ def get_frame_provenance(
     except services.RollNotFoundError:
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
     except services.ProvenanceRangeError:
+        raise HTTPException(status_code=422, detail="end 不能小于 start")
+
+
+@app.get(
+    "/rolls/{roll_no}/master-picks",
+    response_model=schemas.MasterPicksOut,
+    tags=["胶卷母版选片"],
+)
+def get_roll_master_picks(
+    roll_no: str,
+    start: int = Query(..., ge=0, description="帧号区间起始（含），非负整数"),
+    end: int = Query(..., ge=0, description="帧号区间结束（含），非负整数，end ≥ start"),
+    conn: Connection = Depends(database.get_db),
+):
+    """胶卷母版选片清单：只处理请求闭区间与当前预期覆盖的交集。
+
+    逐帧从存活批次的扫描出现中剔除已登记瑕疵的位置：同批同帧有多个合格出现时
+    取原始列表最早位置；旧批次（无原始列表）的去重帧视为一个位置为空（null）
+    的合格候选。对每段连续可选帧选择**批次切换次数最少**的来源序列；并列时按
+    帧号顺序逐帧比较批次原导入顺序、再比较原始位置，返回每帧的批次号与位置。
+
+    另返回交集内的**未扫描闭区间**及**已扫描却无合格候选**的帧号（该帧全部
+    扫描出现均已被标记瑕疵）；缺帧用区间集合运算得出，不展开巨大帧号跨度。
+    查询只读并随批次撤销、瑕疵变动实时更新。参数无效（含 end < start）返回
+    422，胶卷不存在（尚未导入任何批次，或最后一批已被撤销）返回 404。
+    """
+    if end < start:
+        raise HTTPException(status_code=422, detail="end 不能小于 start")
+    try:
+        return services.get_master_picks(conn, roll_no.strip(), start, end)
+    except services.RollNotFoundError:
+        raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
+    except services.MasterPickRangeError:
         raise HTTPException(status_code=422, detail="end 不能小于 start")
 
 

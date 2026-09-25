@@ -386,6 +386,47 @@ class FrameProvenanceOut(BaseModel):
     )
 
 
+# ---------- 胶卷母版选片 ----------
+
+class MasterPickItem(BaseModel):
+    frame_no: int = Field(..., description="帧号（位于请求区间与当前预期覆盖的交集内）")
+    batch_id: str = Field(
+        ...,
+        description="该帧母版来源批次：在该帧全部合格候选中，按“段内批次切换次数最少、"
+        "并列时逐帧比较批次原导入顺序与原始位置”选出的存活批次",
+    )
+    position: int | None = Field(
+        ...,
+        description="该帧在来源批次**原始帧列表**中的 0 起算位置（同批同帧多个合格出现"
+        "时取最早位置）；旧批次只有去重帧、没有原始列表时为 null（位置为空的候选）",
+    )
+
+
+class MasterPicksOut(BaseModel):
+    roll_no: str
+    start: int = Field(..., description="请求帧号区间起始（含）")
+    end: int = Field(..., description="请求帧号区间结束（含）")
+    covered_ranges: list[list[int]] = Field(
+        ...,
+        description="请求闭区间与胶卷**当前预期覆盖**的交集（合并后的连续闭区间），"
+        "即本次实际参与选片的全部范围",
+    )
+    picks: list[MasterPickItem] = Field(
+        ...,
+        description="交集内每个有合格候选的帧的选片结果，按帧号升序；"
+        "未扫描帧与无合格候选帧不出现在此列表中"
+    )
+    unscanned_ranges: list[list[int]] = Field(
+        ...,
+        description="交集内**从未扫描**的连续闭区间（区间运算得出，不逐帧展开大跨度）",
+    )
+    no_candidate_frames: list[int] = Field(
+        ...,
+        description="交集内**已扫描却无合格候选**的帧号（升序）：该帧在存活批次中的"
+        "全部扫描出现均已被标记瑕疵；这些帧会隔断连续可选帧段",
+    )
+
+
 class HealthOut(BaseModel):
     status: str
     db: str

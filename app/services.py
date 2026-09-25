@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from bisect import bisect_left
 from datetime import datetime, timedelta, timezone
 
 from . import schemas
@@ -1920,4 +1921,215 @@ def get_delivery_check(
         current_missing_ranges=[list(x) for x in current["missing"]],
         current_out_of_range_frames=current["out_of_range"],
         current_defect_frames=current["defect_frames"],
+    )
+
+
+# ---------- 胶卷母版选片 ----------
+
+class MasterPickRangeError(Exception):
+    """母版选片查询区间非法：end < start。"""
+
+
+def _frame_in_intervals(
+    frame_no: int, intervals: list[tuple[int, int]]
+) -> bool:
+    """frame_no 是否落在任一已合并（升序、互不相邻）闭区间内；二分定位 O(log n)。
+
+    intervals 按 end 升序：bisect_left 找到首个 end ≥ frame_no 的区间，
+    再判断其 start ≤ frame_no（end < frame_no 的区间不可能覆盖该帧）。
+    """
+    idx = bisect_left(intervals, frame_no, key=lambda iv: iv[1])
+    return idx < len(intervals) and intervals[idx][0] <= frame_no
+
+
+def _pick_for_run(
+    run: list[int],
+    candidates: dict[int, list[tuple[int, int | None]]],
+) -> list[tuple[int, int | None]]:
+    """对一段连续可选帧选择批次切换次数最少的来源序列（纯函数，便于测试）。
+
+    ``candidates[f]`` 为帧 f 的合格候选列表，每个候选是
+    ``(批次原导入顺序序号, 原始位置)``，且按（导入顺序, 原始位置）升序；
+    旧批次的去重帧位置为 ``None``（位置为空），并列比较时排在有位置者之前。
+
+    后向动态规划：cost[i][c] = 第 i 帧选候选 c 时，该帧起到段末的最少切换次数。
+    随后自段首贪心：每一步在保持最小总切换的候选中取 (导入顺序, 原始位置)
+    字典序最前者。候选已按导入顺序升序、同批至多一个候选（最早合格位置），
+    故并列即按帧号顺序逐帧比较批次原导入顺序、再比较原始位置。
+
+    返回与 ``run`` 等长、对齐的 (批次原导入顺序序号, 原始位置 | None) 序列。
+    """
+    # cost[i]：该帧每个候选对应的“本帧起到段末最少切换次数”，与候选同序
+    cost: list[list[int]] = [[0] * len(candidates[f]) for f in run]
+    for i in range(len(run) - 2, -1, -1):
+        cur = candidates[run[i]]
+        nxt = candidates[run[i + 1]]
+        for ci, (cur_order, _cur_pos) in enumerate(cur):
+            best = None
+            for ni, (nxt_order, _nxt_pos) in enumerate(nxt):
+                value = cost[i + 1][ni] + (0 if nxt_order == cur_order else 1)
+                if best is None or value < best:
+                    best = value
+            cost[i][ci] = best  # 每帧至少一个候选，best 必不为 None
+
+    chosen: list[tuple[int, int | None]] = []
+    chosen_order: int | None = None
+    # 上一步所选候选的后缀代价 cost[i][c]（含 i→i+1 起的切换，不含 i-1→i）；
+    # 本帧候选的“加上与前缀衔接后的切换数”必须恰好等于它，前缀才仍在最优解上
+    remaining: int | None = None
+    for i, frame_no in enumerate(run):
+        best_key: tuple[int, int, int] | None = None
+        best_candidate: tuple[int, int | None] | None = None
+        best_suffix_cost: int | None = None
+        for ci, (order, pos) in enumerate(candidates[frame_no]):
+            suffix_cost = cost[i][ci]
+            switches = suffix_cost
+            if chosen_order is not None and order != chosen_order:
+                switches += 1
+            if remaining is not None and switches != remaining:
+                continue
+            # 位置并列：空位置（旧批次，None）视为最早
+            pos_key = -1 if pos is None else pos
+            key = (switches, order, pos_key)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_candidate = (order, pos)
+                best_suffix_cost = suffix_cost
+        assert best_key is not None and best_candidate is not None
+        remaining = best_suffix_cost
+        chosen_order = best_candidate[0]
+        chosen.append(best_candidate)
+    return chosen
+
+
+def get_master_picks(
+    conn: sqlite3.Connection,
+    roll_no: str,
+    start: int,
+    end: int,
+) -> schemas.MasterPicksOut:
+    """胶卷母版选片：在请求闭区间与当前预期覆盖的交集内逐帧选定母版来源。
+
+    全程只读、实时重算（不缓存），批次撤销与瑕疵标记变动即时生效：
+
+    - 只处理请求区间与**当前合并预期覆盖**的交集（区间运算，不展开跨度）；
+      交集之外（未覆盖）的帧一律不参与。
+    - 逐帧从**存活批次**的扫描出现中剔除已登记瑕疵的位置；同批同帧有多个
+      合格出现时取**原始列表最早位置**；旧批次（无原始列表）的去重帧视为
+      一个**位置为空**（null）的合格候选，无法登记瑕疵故恒为合格。
+    - 对每段连续可选帧（被未扫描帧或无合格候选帧隔断）选择**批次切换次数
+      最少**的来源序列；并列时按帧号顺序逐帧比较批次原导入顺序、再比较原始
+      位置（空位置视为最早）。
+    - 另返回交集内的未扫描闭区间，及已扫描却无合格候选的帧号。未扫描部分
+      只做区间集合差，即使帧号跨度巨大也不逐帧展开。
+
+    - end < start 抛 MasterPickRangeError（接口返回 422）；
+      胶卷不存在（无任何存活批次）抛 RollNotFoundError（接口返回 404）。
+    """
+    if end < start:
+        raise MasterPickRangeError()
+    query_window = [(start, end)]
+
+    # 只读事务：预期覆盖、批次原始列表与瑕疵标记来自同一一致状态
+    conn.execute("BEGIN")
+    try:
+        if not _roll_exists(conn, roll_no):
+            raise RollNotFoundError(roll_no)
+
+        expected = _expected_ranges(conn, roll_no)
+        covered = intersect_intervals(expected, query_window)
+
+        # 批次按原导入顺序排列；序号即并列裁决所用的“批次原导入顺序”
+        batch_rows = conn.execute(
+            """SELECT id, raw_frames_json, frames_json
+                 FROM batches
+                WHERE roll_no = ?
+                ORDER BY created_at, rowid""",
+            (roll_no,),
+        ).fetchall()
+
+        # frame -> [(导入顺序, 原始位置 | None)]，只保留交集中的帧
+        candidates: dict[int, list[tuple[int, int | None]]] = {}
+        scanned_in_window: set[int] = set()
+        for order, br in enumerate(batch_rows):
+            has_raw = br["raw_frames_json"] is not None
+            marked_positions = {
+                row["position"]
+                for row in conn.execute(
+                    "SELECT position FROM batch_defects WHERE batch_id = ?",
+                    (br["id"],),
+                ).fetchall()
+            }
+            if has_raw:
+                raw_frames: list[int] = json.loads(br["raw_frames_json"])
+                # 同帧合格出现可能多次（批内重复）：逐位置剔除瑕疵，取最早合格位置
+                earliest_ok: dict[int, int] = {}
+                for idx, frame_no in enumerate(raw_frames):
+                    if not _frame_in_intervals(frame_no, covered):
+                        continue
+                    scanned_in_window.add(frame_no)
+                    if idx in marked_positions:
+                        continue
+                    if frame_no not in earliest_ok:
+                        earliest_ok[frame_no] = idx
+                for frame_no, pos in earliest_ok.items():
+                    candidates.setdefault(frame_no, []).append((order, pos))
+            else:
+                # 旧批次只有去重帧集合：按一个位置为空（None）的合格候选处理
+                for frame_no in json.loads(br["frames_json"]):
+                    if not _frame_in_intervals(frame_no, covered):
+                        continue
+                    scanned_in_window.add(frame_no)
+                    candidates.setdefault(frame_no, []).append((order, None))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    # 未扫描区间 = 交集覆盖 − 交集中的实扫帧；纯区间运算，不展开大跨度。
+    # scanned_in_window 中的帧在上面收集时已按 covered 过滤，无需再判一次。
+    scanned_ranges = frames_to_ranges(scanned_in_window)
+    unscanned = _subtract_merged(covered, scanned_ranges)
+
+    # 候选列表按（批次原导入顺序, 原始位置）升序（同批同帧已收敛为一个候选）
+    for options in candidates.values():
+        options.sort(key=lambda c: (c[0], -1 if c[1] is None else c[1]))
+
+    selectable = sorted(candidates)
+    # 已扫描却无合格候选的帧：交集中的实扫帧但候选为空（全部出现均已被标记瑕疵）
+    no_candidate = sorted(scanned_in_window - candidates.keys())
+
+    # 连续可选帧分段（未扫描帧与无合格候选帧均隔断），各段独立最少切换
+    order_to_id = {i: br["id"] for i, br in enumerate(batch_rows)}
+    picks: list[schemas.MasterPickItem] = []
+    run: list[int] = []
+
+    def _flush(run_frames: list[int]) -> None:
+        for frame_no, (order, pos) in zip(
+            run_frames, _pick_for_run(run_frames, candidates)
+        ):
+            picks.append(
+                schemas.MasterPickItem(
+                    frame_no=frame_no,
+                    batch_id=order_to_id[order],
+                    position=pos,
+                )
+            )
+
+    for frame_no in selectable:
+        if run and frame_no != run[-1] + 1:
+            _flush(run)
+            run = []
+        run.append(frame_no)
+    if run:
+        _flush(run)
+
+    return schemas.MasterPicksOut(
+        roll_no=roll_no,
+        start=start,
+        end=end,
+        covered_ranges=[list(x) for x in covered],
+        picks=picks,
+        unscanned_ranges=[list(x) for x in unscanned],
+        no_candidate_frames=no_candidate,
     )
